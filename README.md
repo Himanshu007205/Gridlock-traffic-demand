@@ -2,7 +2,7 @@
 
 A gradient-boosting pipeline that predicts traffic demand for geohash locations at 15-minute intervals, built for the Gridlock Hackathon 2.0.
 
-**Final leaderboard score:** `XX.XX` <!-- replace with your score -->
+**Final leaderboard score:** `172` <!-- replace with your score -->
 
 ---
 
