@@ -1,0 +1,13 @@
+# Competition data (download from the hackathon page)
+data/*
+!data/.gitkeep
+train.csv
+test.csv
+sample_submission.csv
+
+# Python / Jupyter
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

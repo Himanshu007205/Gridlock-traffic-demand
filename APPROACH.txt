@@ -1,0 +1,172 @@
+========================================================================
+GRIDLOCK HACKATHON 2.0 — Traffic Demand Prediction
+Final submission
+========================================================================
+
+------------------------------------------------------------------------
+PROBLEM OVERVIEW
+------------------------------------------------------------------------
+Predict traffic demand (0–1 normalised) for specific geohash locations
+at 15-minute timestamps on Day 49 of a multi-day dataset.  Training data
+covers Days 48–49 (Day 49 only up to 2:00); the test set asks for
+Day 49 from 2:15 onward, through 13:45.
+
+------------------------------------------------------------------------
+CORE INSIGHT / STRATEGY
+------------------------------------------------------------------------
+Day 48 is a near-perfect structural proxy for Day 49.  Instead of
+predicting demand from scratch, we:
+
+  1. Look up the exact Day-48 demand for the same (geohash, timestamp).
+  2. Compute how the d49/d48 ratio is trending across hours 0, 1, 2
+     (the only hours of Day 49 that are observable).
+  3. Fit a linear trend on those three ratio observations per geohash
+     and extrapolate it to the target test hour.
+  4. Multiply the d48 demand by this extrapolated ratio.
+
+The "ratio_at_hour" feature is consistently the single most important
+predictor.
+
+------------------------------------------------------------------------
+FEATURE ENGINEERING (57 features total)
+------------------------------------------------------------------------
+
+** Temporal Features **
+- hour, minute, time_slot (0–95), time_of_day (fractional hour)
+- Cyclical encodings: sin/cos of hour and time_slot
+- is_peak flag  (07:00–10:00), is_night flag (22:00–05:00)
+- day (48 or 49)
+
+** Spatial Features **
+- Latitude and longitude decoded from geohash (via pygeohash)
+- Label-encoded geohash, geo3, geo4, geo5 prefixes
+
+** Road / Environment Features **
+- LargeVehicles allowed (binary), Landmarks present (binary)
+- RoadType ordinal (Residential=0, Street=1, Highway=2)
+- Weather ordinal (Sunny=0, Rainy=1, Foggy=2, Snowy=3)
+- NumberofLanes, Temperature (median-filled per geohash)
+
+** Cross-Day Core Features (strongest signals) **
+- d48_demand          : exact d48 lookup at (geohash, timestamp)
+- d48_hr_curr/prev    : d48 demand by hour (fallback when ts missing)
+- d49_same_hr         : d49 demand at same hour (available for h0–2)
+- d49_prev_hr         : d49 demand one hour earlier
+
+** Slot-Level D48 Temporal Smoothing **
+A single 15-min slot in d48 can be noisy.  We look up the ±1 slot
+neighbours and compute a 3-slot rolling mean:
+- d48_prev_slot       : d48 demand 15 min before the target slot
+- d48_next_slot       : d48 demand 15 min after the target slot
+- d48_roll3_mean      : mean(prev, curr, next) — stable baseline
+- d48_roll3_hratio_pred : roll3_mean × ratio_at_hour (best combined rule)
+
+** D49 Slot-Level Anchors **
+D49 has 15-min granularity too.  Slot 2:00 is the single closest known
+d49 observation to the test start (2:15), making it a powerful anchor:
+- d49_at_2_0          : d49 demand at exactly timestamp 2:0 per geo
+- d49_last2_mean      : mean of d49 at timestamps 1:45 and 2:0 per geo
+
+** Ratio Features  **
+- ratio_at_hour       : linear extrapolation of d49/d48 ratio to the
+                        target hour — THE key signal
+- ratio_at_h2         : ratio pinned at hour 2 (most recent anchor)
+- ratio_slope         : slope direction of the ratio trend per geohash
+- day_ratio           : simple early-mean d49/d48 ratio (geo fallback)
+- geo4_ratio          : geo4-level ratio (sparser-geo fallback)
+
+** Scaled Prediction Features **
+- d48_day_ratio_pred      : d48_demand × day_ratio
+- d48_hour_ratio_pred     : d48_demand × ratio_at_hour
+- d48_geo4_ratio_pred     : d48_demand × geo4_ratio
+- geo_hour_ratio_pred     : geo_hour_mean × day_ratio
+- geo4_hour_ratio_pred    : geo4_hour_mean × geo4_ratio
+- geo_hour_hratio_pred    : geo_hour_mean × ratio_at_hour
+
+** Geo × Hour Historical Statistics (from d48) **
+- geo_hour_mean/std/med/q25/q75  per (geohash, hour)
+- geo_d48_mean/std/med            per geohash
+- geo4_hour_mean                  per (geo4, hour)
+- geo3_hour_mean                  per (geo3, hour)
+
+** D49 Trend Features  **
+- d49_trend        : linear slope of d49 demand across observed hours
+- d49_last_demand  : last observed d49 demand value per geohash
+- d49_extrapolated : trend projection to target hour
+
+** Structural Features **
+- d48_day_slope      : linear slope of d48 demand across all day hours,
+                       per geohash (captures rising vs. falling geos)
+- geo4_neighbor_mean : mean d48 demand of geo4 siblings excluding self
+                       (spatial smoothing for sparse geohashes)
+
+------------------------------------------------------------------------
+MODEL
+------------------------------------------------------------------------
+Algorithm : LightGBM (LGBMRegressor)
+Objective : regression (RMSE)
+
+Key parameters:
+  learning_rate     = 0.015   (slower, more stable)
+  num_leaves        = 511
+  n_estimators      = 4000    (compensates lower learning rate)
+  min_child_samples = 20      (mild regularisation)
+  feature_fraction  = 0.8
+  bagging_fraction  = 0.8, freq=5
+  reg_alpha=0.05, reg_lambda=0.1
+  early_stopping    = 150 rounds
+
+Cross-validation : 5-fold KFold with shuffle
+
+Sample weighting : Day-49 rows are upweighted 9× relative to Day-48
+rows, because the evaluation metric is R² on Day 49 predictions only.
+
+------------------------------------------------------------------------
+SEED ENSEMBLE 
+------------------------------------------------------------------------
+LightGBM with bagging exhibits non-trivial variance between runs.  We
+train the full 5-fold CV with 5 different random seeds:
+  SEEDS = [42, 7, 123, 314, 999]
+
+This gives 5 × 5 = 25 models.  Final predictions are the mean of all
+25 model outputs.  Seed averaging reduces run-to-run variance.
+
+------------------------------------------------------------------------
+POST-PROCESSING
+------------------------------------------------------------------------
+A soft blend is applied between the ensemble output and the rule-based
+d48_hour_ratio_pred baseline:
+
+  final_pred = 0.95 × model_pred + 0.05 × d48_hour_ratio_pred
+
+Both sides are clipped to [0, 1] before blending.  The blend is only
+applied if it improves the OOF d49 R²; otherwise raw predictions are
+used.  The 5% weight was chosen to anchor extreme extrapolations without
+distorting the well-calibrated model output.
+
+------------------------------------------------------------------------
+VALIDATION METRIC
+------------------------------------------------------------------------
+Primary proxy: R² on Day-49 OOF rows only (mirrors the leaderboard).
+We report both R²_all and R²_d49.  All version comparisons use R²_d49.
+
+------------------------------------------------------------------------
+TOOLS & LIBRARIES
+------------------------------------------------------------------------
+- Python 3.x
+- pandas, numpy           — data manipulation
+- LightGBM                — gradient boosted trees (primary model)
+- scikit-learn            — KFold, LabelEncoder, r2_score
+- pygeohash               — decode geohash to lat/lon coordinates
+- matplotlib              — feature importance visualisation
+
+------------------------------------------------------------------------
+SOURCE FILES
+------------------------------------------------------------------------
+GridlockHackathon.ipynb       Main Jupyter notebook (all code)
+submission.csv                 Final predictions (Index, demand columns)
+approach.txt                   This file
+
+========================================================================
+END OF APPROACH DESCRIPTION
+========================================================================
